@@ -1,3 +1,5 @@
+#![feature(await_macro, async_await, futures_api)]
+
 use crate::boostencode::{FromValue, Value};
 use clap::App;
 use clap::load_yaml;
@@ -11,13 +13,12 @@ use rand::prelude::*;
 use simple_logger::init_with_level;
 use std::fs::File;
 use std::io::Read;
+use tokio::run_async;
 
 mod boostencode;
 mod metainfo;
 mod tracker;
-mod server;
-mod piece;
-mod peer;
+mod coordinator;
 
 fn main() {
     let yaml = load_yaml!("cli.yml");
@@ -47,9 +48,10 @@ fn main() {
         debug!("{:?}", metainfo);
 
         let peer_id = gen_peer_id();
+        tokio::spawn_async(async move {
+            coordinator::init_coordinator(metainfo, peer_id);
+        });
 
-        let server = server::Server::new(peer_id, metainfo);
-        tokio::run(server);
     } else {
         error!("No torrent file provided");
     }
@@ -59,7 +61,7 @@ fn gen_peer_id() -> [u8; 20] {
     // Generate peer id in Azures style ("-<2 letter client code><4 digit version number>-<12 random digits>")
     let mut id = "-BO0001-".to_owned();
     for _ in 0..12 {
-        id.push_str(&thread_rng().gen_range::<u8>(0, 9).to_string());
+        id.push_str(&thread_rng().gen_range::<u8, u8, u8>(0, 9).to_string());
     }
     let mut res = [0; 20];
     res.copy_from_slice(id.as_bytes());

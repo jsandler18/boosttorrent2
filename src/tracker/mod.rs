@@ -1,31 +1,16 @@
 use crate::boostencode::{DecodeError, FromValue, Value};
-use hyper;
-use hyper::{
-    Client,
-    http::uri::InvalidUri,
-    StatusCode,
-};
 use log::trace;
-use maplit::hashmap;
-use percent_encoding::{
-    percent_encode,
-    QUERY_ENCODE_SET,
+use reqwest::{
+    r#async::Client,
+    StatusCode,
 };
 use std::fmt;
 use std::net::{
     IpAddr,
     SocketAddr,
 };
-use tokio::prelude::{
-    Async,
-    Future,
-    future::{
-        empty,
-        err,
-        ok,
-    },
-    Stream,
-};
+use tokio::await;
+use tokio::prelude::*;
 
 #[cfg(test)]
 mod test;
@@ -81,10 +66,8 @@ pub enum TrackerResponse {
 
 #[derive(Debug, derive_error::Error)]
 pub enum TrackerError {
-    /// The uri we wanted to request was somehow invalid
-    InvalidURI(InvalidUri),
     /// Could not connect to the tracker
-    ConnectionError(hyper::Error),
+    ConnectionError(reqwest::Error),
     /// The tracker returned a non 200 status code
     #[error(non_std, no_from)]
     ResponseError(u16),
@@ -94,7 +77,7 @@ pub enum TrackerError {
     InvalidResponse,
 }
 
-enum Event {
+pub enum Event {
     Started,
     Stopped,
     Completed,
@@ -206,140 +189,35 @@ impl FromValue for TrackerResponse {
     }
 }
 
-impl Tracker {
-    /// Create a new Tracker
-    pub fn new(
-        peer_id: [u8; 20],
-        tracker_uri: String,
-        info_hash: [u8; 20],
-        port: u16) -> Self {
-        Tracker {
-            peer_id,
-            tracker_uri,
-            info_hash,
-            port,
-            tracker_id: None,
-            request: Box::new(err(TrackerError::InvalidResponse)),
-        }
+pub async fn announce(event: Option<Event>,
+                      uploaded: u64,
+                      downloaded: u64,
+                      left: u64,
+                      tracker_id: Option<String>,
+                      tracker_url: String,
+                      peer_id: ::std::sync::Arc<[u8; 20]>,
+                      info_hash: ::std::sync::Arc<[u8; 20]>,
+                      listen_port: u16) -> Result<TrackerResponse, TrackerError> {
+    let mut req_builder = Client::new().get(&tracker_url)
+        .query(&[
+            ("port", listen_port.to_string()),
+            ("uploaded", uploaded.to_string()),
+            ("downloaded", downloaded.to_string()),
+            ("left", left.to_string())])
+        .query(&[
+            ("info_hash", &*info_hash),
+            ("peer_id", &*peer_id)]);
+    if let Some(e) = event {
+        req_builder = req_builder.query(&[("event", e.to_string())]);
     }
-
-    /// Tell the tracker that you are starting your download
-    pub fn start(&mut self, download_size: u64) {
-        self.request = Box::new(self.announce(Some(Event::Started), download_size, 0, 0))
+    if let Some(id) = tracker_id {
+        req_builder = req_builder.query(&[("trackerid", id.to_string())]);
     }
-
-    /// Tell the tracker that you are stopping your download without finishing.
-    pub fn cancel(&mut self, left: u64, uploaded: u64, downloaded: u64) {
-        self.request = Box::new(self.announce(Some(Event::Stopped), left, uploaded, downloaded))
+    let response = await!(req_builder.send())?;
+    if response.status() != StatusCode::OK {
+        return Err(TrackerError::ResponseError(response.status().as_u16()));
     }
-
-    /// Tell the tracker that you have completed the download
-    pub fn finish(&mut self, left: u64, uploaded: u64, downloaded: u64) {
-        self.request = Box::new(self.announce(Some(Event::Completed), left, uploaded, downloaded))
-    }
-
-    /// Update the tracker on your download status, and get more peers
-    pub fn refresh(&mut self, left: u64, uploaded: u64, downloaded: u64) {
-        self.request = Box::new(self.announce(None, left, uploaded, downloaded))
-    }
-
-    fn announce(&self, event: Option<Event>, left: u64, uploaded: u64, downloaded: u64) -> impl Future<Item=TrackerResponse, Error=TrackerError> {
-        // build the tracker query string
-        let mut req_uri = self.tracker_uri.clone();
-        let encoded_info_hash = percent_encode(&self.info_hash, QUERY_ENCODE_SET).to_string();
-        let encoded_peer_id = percent_encode(&self.peer_id, QUERY_ENCODE_SET).to_string();
-        let query = hashmap! {
-            "info_hash" => encoded_info_hash,
-            "peer_id" => encoded_peer_id,
-            "port" => self.port.to_string(),
-            "uploaded" => uploaded.to_string(),
-            "downloaded" => downloaded.to_string(),
-            "left" => left.to_string(),
-            "compact" => 0.to_string(),
-        };
-        req_uri.push('?');
-        query.iter().fold(&mut req_uri, |s, (k, v)| {
-            s.push_str(k);
-            s.push('=');
-            s.push_str(&v);
-            s.push('&');
-            s
-        });
-        match event {
-            Some(e) => {
-                req_uri.push_str("event");
-                req_uri.push('=');
-                req_uri.push_str(&e.to_string());
-                req_uri.push('&')
-            }
-            None => ()
-        }
-        match &self.tracker_id {
-            Some(id) => {
-                req_uri.push_str("trackerid");
-                req_uri.push('=');
-                req_uri.push_str(&percent_encode(id.as_bytes(), QUERY_ENCODE_SET).to_string());
-                req_uri.push('&')
-            }
-            None => ()
-        }
-        let _ = req_uri.pop();
-        let client = Client::new();
-        let uri = match hyper::http::HttpTryFrom::try_from(&req_uri) {
-            Ok(uri) => ok(uri),
-            Err(e) => err(TrackerError::InvalidURI(e))
-        };
-        // Start the tracker query future
-        uri.and_then(move |uri| {
-            client.get(uri).map_err(|e| TrackerError::ConnectionError(e))
-        }).and_then(|get_response| {
-            if get_response.status() == StatusCode::OK {
-                Ok(get_response.into_body())
-            } else {
-                Err(TrackerError::ResponseError(get_response.status().as_u16()))
-            }
-        }).and_then(|body| {
-            body.map(|chunk| {
-                Vec::from(&*chunk)
-            }).concat2()
-                .map_err(|e| TrackerError::ConnectionError(e))
-        }).and_then(|resp_bytes| {
-            Value::decode(&resp_bytes).map_err(|e| TrackerError::DecodeError(e))
-        }).and_then(|val| {
-            trace!("response: {:?}", val);
-            TrackerResponse::from_value(&val)
-                .map_err(|_| TrackerError::InvalidResponse)
-        })
-    }
-
-    /// Updates the tracker id based on a tracker response
-    fn update_tracker_id(&mut self, response: &TrackerResponse) {
-        match response {
-            TrackerResponse::Success(r) | TrackerResponse::Warning(_, r) => {
-                match &r.tracker_id {
-                    Some(id) => self.tracker_id = Some(id.clone()),
-                    None => ()
-                }
-            }
-            _ => ()
-        }
-    }
-}
-
-impl Future for Tracker {
-    type Item = TrackerResponse;
-    type Error = TrackerError;
-
-    fn poll(&mut self) -> Result<Async<Self::Item>, Self::Error> {
-        let poll = self.request.poll();
-        // if ready, update the tracker id to the response value, and set it up so that subsequent
-        // polls will return not ready
-        if let Ok(Async::Ready(res)) = poll {
-            self.update_tracker_id(&res);
-            self.request = Box::new(empty());
-            Ok(Async::Ready(res))
-        } else {
-            poll
-        }
-    }
+    let body = await!(response.into_body().map(|chunk| Vec::from(&*chunk)).concat2())?;
+    let bdecoded = Value::decode(&body)?;
+    TrackerResponse::from_value(&bdecoded).map_err(|_| TrackerError::InvalidResponse)
 }
