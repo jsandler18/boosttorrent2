@@ -1,4 +1,4 @@
-#![feature(await_macro, async_await, futures_api)]
+#![feature(await_macro, async_await)]
 
 use crate::boostencode::{FromValue, Value};
 use clap::App;
@@ -49,7 +49,7 @@ fn main() {
 
         let peer_id = gen_peer_id();
         tokio::spawn_async(async move {
-            coordinator::init_coordinator(metainfo, peer_id);
+            await!(coordinator::init_coordinator(metainfo, peer_id));
         });
 
     } else {

@@ -12,25 +12,6 @@ use std::net::{
 use tokio::await;
 use tokio::prelude::*;
 
-#[cfg(test)]
-mod test;
-
-
-pub struct Tracker {
-    // The 20 byte unique identifier for this instance of the client
-    peer_id: [u8; 20],
-    // The uri of the tracker
-    tracker_uri: String,
-    // The SHA1 hash of the value of the info key in the torrent file
-    info_hash: [u8; 20],
-    // The port we will be listening on for peer connections
-    port: u16,
-    // A string the client should send on subsequent announcements
-    tracker_id: Option<String>,
-    // The shared state of the client
-    // A future of the must recent tracker request
-    request: Box<dyn Future<Item=TrackerResponse, Error=TrackerError> + Send>,
-}
 
 #[derive(Debug, PartialEq)]
 pub struct PeerInfo {
